@@ -1,0 +1,16 @@
+../Core/Src/main.c:95:16:ms5837_crc4	48	static
+../Core/Src/main.c:113:26:ms5837_cmd	24	static
+../Core/Src/main.c:118:13:ms5837_init	40	static
+../Core/Src/main.c:134:26:ms5837_read_adc	56	static
+../Core/Src/main.c:147:13:ms5837_measure	416	static
+../Core/Src/main.c:193:13:led_set	16	static
+../Core/Src/main.c:198:13:leds_update	24	static
+../Core/Src/main.c:214:26:flash_read_id	40	static
+../Core/Src/main.c:229:5:main	80	static
+../Core/Src/main.c:359:6:SystemClock_Config	64	static
+../Core/Src/main.c:398:13:MX_I2C1_Init	8	static
+../Core/Src/main.c:446:13:MX_I2C2_Init	8	static
+../Core/Src/main.c:494:13:MX_SPI1_Init	8	static
+../Core/Src/main.c:534:13:MX_USART1_UART_Init	8	static
+../Core/Src/main.c:582:13:MX_GPIO_Init	48	static
+../Core/Src/main.c:631:6:Error_Handler	8	static,ignoring_inline_asm
