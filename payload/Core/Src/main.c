@@ -95,6 +95,9 @@ volatile uint8_t ack_ok = 0;
 MS5837_t ps1 = { .hi2c = &hi2c1 };   // tanksensor op bus 1
 MS5837_t ps2 = { .hi2c = &hi2c2 };   // tanksensor op bus 2
 uint32_t t_acc = 0, t_pres = 0, above_since = 0;
+// Diagnose LED1: welke sensorcontrole faalt (bitmasker, zie leds_update)
+volatile uint8_t sens_fault = 0, sens_fault_seen = 0;
+uint32_t t_retry = 0;
 uint8_t flash_id[3];
 volatile HAL_StatusTypeDef st_flash;
 const CS_Pin_t flash_cs = { GPIOA, GPIO_PIN_4 };   // W25Q256JV /CS op PA4
@@ -218,6 +221,33 @@ static void ms5837_measure(MS5837_t *s)
   if (s->is_02ba) s->pres = (int32_t)(P >> 15);                    // Pa
   else            s->pres = (int32_t)(P >> 13) * 10;               // 0,1 mbar → Pa
 }
+// BNO055: chip-ID controleren en instellen op 16 g, ACCONLY-modus.
+// Wordt bij het opstarten aangeroepen en opnieuw (vóór de lancering) als het mislukte.
+static void bno055_init(void)
+{
+  // Chip-ID controleren (moet 0xA0 zijn)
+  uint8_t id = 0;
+  for (int i = 0; i < 5; i++) {
+      st_id = HAL_I2C_Mem_Read(&hi2c1, 0x28 << 1, 0x00, I2C_MEMADD_SIZE_8BIT, &id, 1, 100);
+      if (st_id == HAL_OK) break;
+      HAL_Delay(10);
+  }
+  bno_id = id;
+  if (id != 0xA0) return;   // niet gevonden: later opnieuw proberen
+
+  // Versnellingsmeter instellen: 16 g, ACCONLY-modus
+  uint8_t v;
+  v = 0x00; HAL_I2C_Mem_Write(&hi2c1, 0x28 << 1, 0x3D, I2C_MEMADD_SIZE_8BIT, &v, 1, 100);  // CONFIG-modus
+  HAL_Delay(25);
+  v = 0x01; HAL_I2C_Mem_Write(&hi2c1, 0x28 << 1, 0x07, I2C_MEMADD_SIZE_8BIT, &v, 1, 100);  // page 1
+  v = 0x0F; HAL_I2C_Mem_Write(&hi2c1, 0x28 << 1, 0x08, I2C_MEMADD_SIZE_8BIT, &v, 1, 100);  // 16 g, 62,5 Hz
+  HAL_I2C_Mem_Read(&hi2c1, 0x28 << 1, 0x08, I2C_MEMADD_SIZE_8BIT, &v, 1, 100);             // terug lezen
+  acc_cfg = v;
+  v = 0x00; HAL_I2C_Mem_Write(&hi2c1, 0x28 << 1, 0x07, I2C_MEMADD_SIZE_8BIT, &v, 1, 100);  // page 0
+  v = 0x01; HAL_I2C_Mem_Write(&hi2c1, 0x28 << 1, 0x3D, I2C_MEMADD_SIZE_8BIT, &v, 1, 100);  // ACCONLY
+  HAL_Delay(20);
+}
+
 static void led_set(uint16_t pin, int on)
 {
   HAL_GPIO_WritePin(GPIOB, pin, on ? GPIO_PIN_SET : GPIO_PIN_RESET);
@@ -229,10 +259,17 @@ static void leds_update(uint32_t now)
   led_set(GPIO_PIN_0, (now / 500) % 2);
 
   // LED1: sensoren in orde -> aan, anders snel knipperen
-  int sens_ok = (bno_id == 0xA0) && (st_acc == HAL_OK)
-             && ps1.crc_ok && ps2.crc_ok
-             && (ps1.st == HAL_OK) && (ps2.st == HAL_OK);
-  led_set(GPIO_PIN_1, sens_ok ? 1 : (now / 100) % 2);
+  // sens_fault toont welke controle faalt; sens_fault_seen onthoudt ook korte fouten
+  uint8_t f = 0;
+  if (bno_id != 0xA0)    f |= 0x01;   // BNO055 niet herkend (chip-ID)
+  if (st_acc != HAL_OK)  f |= 0x02;   // versnelling lezen faalt
+  if (!ps1.crc_ok)       f |= 0x04;   // MS5837 bus 1: kalibratie (PROM/CRC) mislukt
+  if (!ps2.crc_ok)       f |= 0x08;   // MS5837 bus 2: kalibratie (PROM/CRC) mislukt
+  if (ps1.st != HAL_OK)  f |= 0x10;   // MS5837 bus 1: meting faalt
+  if (ps2.st != HAL_OK)  f |= 0x20;   // MS5837 bus 2: meting faalt
+  sens_fault = f;
+  sens_fault_seen |= f;
+  led_set(GPIO_PIN_1, f == 0 ? 1 : (now / 100) % 2);
 
   // LED2: lancering en camera
   if (!launched)    led_set(GPIO_PIN_2, 0);
@@ -328,26 +365,7 @@ int main(void)
   }
   HAL_Delay(300);
 
-  // Chip-ID controleren (moet 0xA0 zijn)
-  uint8_t id = 0;
-  for (int i = 0; i < 5; i++) {
-      st_id = HAL_I2C_Mem_Read(&hi2c1, 0x28 << 1, 0x00, I2C_MEMADD_SIZE_8BIT, &id, 1, 100);
-      if (st_id == HAL_OK) break;
-      HAL_Delay(10);
-  }
-  bno_id = id;
-
-  // Versnellingsmeter instellen: 16 g, ACCONLY-modus
-  uint8_t v;
-  v = 0x00; HAL_I2C_Mem_Write(&hi2c1, 0x28 << 1, 0x3D, I2C_MEMADD_SIZE_8BIT, &v, 1, 100);  // CONFIG-modus
-  HAL_Delay(25);
-  v = 0x01; HAL_I2C_Mem_Write(&hi2c1, 0x28 << 1, 0x07, I2C_MEMADD_SIZE_8BIT, &v, 1, 100);  // page 1
-  v = 0x0F; HAL_I2C_Mem_Write(&hi2c1, 0x28 << 1, 0x08, I2C_MEMADD_SIZE_8BIT, &v, 1, 100);  // 16 g, 62,5 Hz
-  HAL_I2C_Mem_Read(&hi2c1, 0x28 << 1, 0x08, I2C_MEMADD_SIZE_8BIT, &v, 1, 100);             // terug lezen
-  acc_cfg = v;
-  v = 0x00; HAL_I2C_Mem_Write(&hi2c1, 0x28 << 1, 0x07, I2C_MEMADD_SIZE_8BIT, &v, 1, 100);  // page 0
-  v = 0x01; HAL_I2C_Mem_Write(&hi2c1, 0x28 << 1, 0x3D, I2C_MEMADD_SIZE_8BIT, &v, 1, 100);  // ACCONLY
-  HAL_Delay(20);
+  bno055_init();   // chip-ID + 16 g ACCONLY (zie USER CODE 0)
 
   ms5837_init(&ps1);
   ms5837_init(&ps2);
@@ -464,6 +482,15 @@ int main(void)
 	        rec.temp = ps2.temp; rec.pres = ps2.pres;
 	        st_log = FlashLogger_LogPayload(&rec, 2, now);
 	      }
+	    }
+
+	    // 2c. Vóór de lancering: sensoren die bij het opstarten niet antwoordden elke seconde
+	    //     opnieuw initialiseren (blokkeert kort, daarom niet meer tijdens de vlucht)
+	    if (!launched && now - t_retry >= 1000) {
+	      t_retry = now;
+	      if (bno_id != 0xA0) bno055_init();
+	      if (!ps1.crc_ok)    ms5837_init(&ps1);
+	      if (!ps2.crc_ok)    ms5837_init(&ps2);
 	    }
 
 	    // 3. LED's bijwerken
