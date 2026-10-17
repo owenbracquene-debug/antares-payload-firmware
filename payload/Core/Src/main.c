@@ -21,6 +21,9 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "flash/flash_helpers.h"
+#include "flash/flash_dump.h"
+#include <string.h>
 
 /* USER CODE END Includes */
 
@@ -45,6 +48,23 @@ typedef struct {
 #define MS5837_ADDR  (0x76 << 1)
 #define FLASH_CS_LOW()   HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET)
 #define FLASH_CS_HIGH()  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET)
+#define RUN_FLASH_READBACK_TEST  1   // readout tester bij het opstarten (raakt de vluchtdata niet)
+#define ERASE_FLASH_ON_BOOT      0   // 1 = wist de VOLLEDIGE flash bij elke start (80-400 s). In TEST_MODE niet nodig, zie hieronder
+
+// Landingsdetectie: |a| stabiel rond 1 g, pas na een minimale vluchtduur
+#define LANDED_MIN_FLIGHT_MS   300000UL  // min. 5 min na lancering (voorkomt trigger onder de parachute)
+#define LANDED_STILL_MS         10000UL  // zo lang moet |a| stilstaan
+#define LANDED_MAX_FLIGHT_MS  1800000UL  // vangnet: na 30 min altijd "geland"
+#define LANDED_G_LOW              785    // 0,8 g in 0,01 m/s²
+#define LANDED_G_HIGH            1177    // 1,2 g
+#define LANDED_SPREAD2         100000UL  // max. spreiding van |a|² in het venster (~0,05 g)
+#define DUMP_RETRY_MS           10000UL  // dump opnieuw proberen als de ESP32 niet antwoordt
+
+// TESTMODUS: vervangt lancerings- en landingsdetectie.
+// Direct na het opstarten START naar de camera + loggen, na TEST_LOG_MS "geland" -> dump via UART.
+#define TEST_MODE                   0    // !! op 0 zetten voor de vlucht !!
+#define TEST_LOG_MS             20000UL  // zo lang loggen in testmodus
+#define TEST_START_DELAY_MS      5000UL  // eerst de XIAO laten opstarten (camera + SD) voor START
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -77,6 +97,14 @@ MS5837_t ps2 = { .hi2c = &hi2c2 };   // tanksensor op bus 2
 uint32_t t_acc = 0, t_pres = 0, above_since = 0;
 uint8_t flash_id[3];
 volatile HAL_StatusTypeDef st_flash;
+const CS_Pin_t flash_cs = { GPIOA, GPIO_PIN_4 };   // W25Q256JV /CS op PA4
+volatile HAL_StatusTypeDef st_log_init, st_log;
+volatile uint8_t flash_test_ok = 0;
+volatile uint8_t landed = 0;
+volatile uint8_t dump_done = 0;
+volatile HAL_StatusTypeDef st_dump = HAL_BUSY;
+volatile uint32_t dump_records = 0;
+uint32_t launch_time = 0, still_since = 0, still_min2 = 0, still_max2 = 0, t_dump = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -211,6 +239,40 @@ static void leds_update(uint32_t now)
   else if (ack_ok)  led_set(GPIO_PIN_2, 1);
   else              led_set(GPIO_PIN_2, (now / 100) % 2);
 }
+// Wacht op een tekstregel van de XIAO die 'needle' bevat (bv. "OK START")
+static uint8_t uart_wait_line(const char *needle, uint32_t timeout_ms)
+{
+  char line[24];
+  uint8_t n = 0;
+  uint32_t t0 = HAL_GetTick();
+  while (HAL_GetTick() - t0 < timeout_ms) {
+    uint8_t c;
+    if (HAL_UART_Receive(&huart1, &c, 1, 5) != HAL_OK) continue;
+    if (c == '\r') continue;
+    if (c == '\n') {
+      line[n] = '\0';
+      if (strstr(line, needle)) return 1;
+      n = 0;
+    } else if (n < sizeof(line) - 1) {
+      line[n++] = (char)c;
+    }
+  }
+  return 0;
+}
+
+// Lancering: camera starten (START, wachten op "OK START") en vanaf nu loggen
+static void start_flight(uint32_t now)
+{
+  launched = 1;
+  launch_time = now;
+  const char msg[] = "START\n";
+  for (int i = 0; i < 10 && !ack_ok; i++) {
+    __HAL_UART_CLEAR_FLAG(&huart1, UART_CLEAR_OREF | UART_CLEAR_NEF | UART_CLEAR_FEF);
+    __HAL_UART_SEND_REQ(&huart1, UART_RXDATA_FLUSH_REQUEST);   // oude "READY" e.d. weggooien
+    HAL_UART_Transmit(&huart1, (uint8_t *)msg, sizeof(msg) - 1, 100);
+    if (uart_wait_line("OK START", 300)) ack_ok = 1;
+  }
+}
 static HAL_StatusTypeDef flash_read_id(uint8_t *id)
 {
   uint8_t cmd = 0x9F;                       // JEDEC ID
@@ -292,6 +354,21 @@ int main(void)
   HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_SET);   // /RESET van de flash hoog
   HAL_Delay(1);
   st_flash = flash_read_id(flash_id);
+
+#if ERASE_FLASH_ON_BOOT
+  st_flash = W25Q_ChipErase(&flash_cs);        // blokkeert tot de chip leeg is
+#endif
+#if RUN_FLASH_READBACK_TEST
+  flash_test_ok = FlashLogger_TestReadBack(&flash_cs);
+#endif
+  st_log_init = FlashLogger_Init(&flash_cs);   // gaat verder na de laatst beschreven pagina
+
+#if TEST_MODE
+  // Testmodus: alleen het gebruikte deel wissen (snel), zodat de dump enkel deze test bevat
+  for (uint32_t a = 0; a < flashLogger.write_addr; a += 4096UL)
+    W25Q_EraseSector(a, &flash_cs);
+  st_log_init = FlashLogger_Init(&flash_cs);   // nu vanaf adres 0
+#endif
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -313,37 +390,80 @@ int main(void)
 	        acc_y = (int16_t)((a[3] << 8) | a[2]);
 	        acc_z = (int16_t)((a[5] << 8) | a[4]);
 
-	        if (!launched) {
-	          uint32_t mag2 = (uint32_t)((int32_t)acc_x * acc_x)
-	                        + (uint32_t)((int32_t)acc_y * acc_y)
-	                        + (uint32_t)((int32_t)acc_z * acc_z);
+	        uint32_t mag2 = (uint32_t)((int32_t)acc_x * acc_x)
+	                      + (uint32_t)((int32_t)acc_y * acc_y)
+	                      + (uint32_t)((int32_t)acc_z * acc_z);
+
+	        if (TEST_MODE) {
+	          // testmodus: detectoren uitgeschakeld (zie hieronder)
+	        } else if (!launched) {
 	          uint32_t thr2 = (uint32_t)LAUNCH_THR * LAUNCH_THR;
 
 	          if (mag2 > thr2) {
 	            if (above_since == 0) above_since = now;
 	            if (now - above_since >= LAUNCH_MS) {
-	              launched = 1;
-	              const char msg[] = "START\n";
-	              for (int i = 0; i < 5 && !ack_ok; i++) {
-	                HAL_UART_Transmit(&huart1, (uint8_t *)msg, sizeof(msg) - 1, 100);
-	                if (HAL_UART_Receive(&huart1, rx_buf, 4, 200) == HAL_OK &&
-	                    rx_buf[0] == 'A' && rx_buf[1] == 'C' && rx_buf[2] == 'K') {
-	                  ack_ok = 1;
-	                }
-	              }
+	              start_flight(now);
 	            }
 	          } else {
 	            above_since = 0;
 	          }
+	        } else if (!landed) {
+	          // 1b. Landingsdetectie: |a| binnen 0,8-1,2 g en nauwelijks variërend
+	          uint32_t lo2 = (uint32_t)LANDED_G_LOW * LANDED_G_LOW;
+	          uint32_t hi2 = (uint32_t)LANDED_G_HIGH * LANDED_G_HIGH;
+	          if (mag2 >= lo2 && mag2 <= hi2) {
+	            if (still_since == 0) {
+	              still_since = now; still_min2 = still_max2 = mag2;
+	            } else {
+	              if (mag2 < still_min2) still_min2 = mag2;
+	              if (mag2 > still_max2) still_max2 = mag2;
+	              if (still_max2 - still_min2 > LANDED_SPREAD2) {   // beweegt nog: venster opnieuw
+	                still_since = now; still_min2 = still_max2 = mag2;
+	              }
+	            }
+	            if (now - launch_time >= LANDED_MIN_FLIGHT_MS &&
+	                now - still_since >= LANDED_STILL_MS)
+	              landed = 1;
+	          } else {
+	            still_since = 0;
+	          }
+	          if (now - launch_time >= LANDED_MAX_FLIGHT_MS)
+	            landed = 1;
 	        }
 	      }
 	    }
 
+	    // 1a. Testmodus: meteen "lancering", na TEST_LOG_MS "geland"
+	    if (TEST_MODE) {
+	      if (!launched && now >= TEST_START_DELAY_MS) start_flight(now);
+	      if (launched && !landed && now - launch_time >= TEST_LOG_MS) landed = 1;
+	    }
+
+	    // 1c. Na de landing: volledige flash naar de ESP32 sturen (blokkeert)
+	    if (landed && !dump_done && (t_dump == 0 || now - t_dump >= DUMP_RETRY_MS)) {
+	      led_set(GPIO_PIN_2, 1);
+	      uint32_t n = 0;
+	      st_dump = FlashDump_SendAll(&huart1, &flash_cs, &n);
+	      dump_records = n;
+	      if (st_dump == HAL_OK) dump_done = 1;
+	      t_dump = HAL_GetTick();
+	      if (t_dump == 0) t_dump = 1;
+	    }
+
 	    // 2. Druk, elke 50 ms
-	    if (now - t_pres >= 50) {
+	    if (!landed && now - t_pres >= 50) {   // na de landing niet meer loggen
 	      t_pres = now;
 	      ms5837_measure(&ps1);
 	      ms5837_measure(&ps2);
+
+	      // 2b. Naar flash, pas vanaf de lancering (= camerastart): één record per druksensor
+	      if (launched) {
+	        Flash_Payload rec = { .acc_x = acc_x, .acc_y = acc_y, .acc_z = acc_z };
+	        rec.temp = ps1.temp; rec.pres = ps1.pres;
+	        st_log = FlashLogger_LogPayload(&rec, 1, now);
+	        rec.temp = ps2.temp; rec.pres = ps2.pres;
+	        st_log = FlashLogger_LogPayload(&rec, 2, now);
+	      }
 	    }
 
 	    // 3. LED's bijwerken
@@ -509,7 +629,7 @@ static void MX_SPI1_Init(void)
   hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi1.Init.NSS = SPI_NSS_SOFT;
-  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_32;
   hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
