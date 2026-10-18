@@ -34,6 +34,14 @@
 #define DUMP_PKT_END          0x03
 #define DUMP_PKT_ACK          0x10
 
+/*
+ * LIVE (STM32 -> ESP32), 0x04: sent every 50 ms while running, no ACK
+ * (the flash keeps the reliable copy). Same frame and record layout as DUMP_DATA:
+ *   LIVE 0x04 : seq(2) count(1) count x record(19)
+ * seq counts up per LIVE frame, so the ESP32 can detect lost frames.
+ */
+#define DUMP_PKT_LIVE         0x04
+
 #define DUMP_REC_SIZE         19
 #define DUMP_RECS_PER_PKT     12          // 3 + 12*19 = 231 bytes payload
 #define DUMP_ACK_TIMEOUT_MS   500
@@ -46,5 +54,12 @@ uint16_t FlashDump_CRC16(const uint8_t *data, uint16_t len, uint16_t crc);
 HAL_StatusTypeDef FlashDump_SendAll(UART_HandleTypeDef *huart,
                                     const CS_Pin_t *cs,
                                     uint32_t *records_sent);
+
+// Sends one LIVE frame with the records of both pressure sensors (sensor 1 and 2).
+// Fire-and-forget: ~47 bytes, ~4 ms at 115200 baud, no ACK.
+HAL_StatusTypeDef FlashDump_SendLive(UART_HandleTypeDef *huart,
+                                     const Flash_Payload *p1,
+                                     const Flash_Payload *p2,
+                                     uint32_t timestamp);
 
 #endif /* INC_FLASH_FLASH_DUMP_H_ */

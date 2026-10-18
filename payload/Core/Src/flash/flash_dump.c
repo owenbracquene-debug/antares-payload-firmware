@@ -140,3 +140,39 @@ HAL_StatusTypeDef FlashDump_SendAll(UART_HandleTypeDef *huart,
 
     return HAL_OK;
 }
+
+/* ------------------------------------------------------------------------ */
+/* Live stream (no ACK)                                                     */
+/* ------------------------------------------------------------------------ */
+static void put_record(uint8_t *r, uint8_t sensor, uint32_t t, const Flash_Payload *p)
+{
+    r[0] = sensor;
+    put_u32(&r[1],  t);
+    put_u32(&r[5],  (uint32_t)p->temp);
+    put_u32(&r[9],  (uint32_t)p->pres);
+    put_u16(&r[13], (uint16_t)p->acc_x);
+    put_u16(&r[15], (uint16_t)p->acc_y);
+    put_u16(&r[17], (uint16_t)p->acc_z);
+}
+
+HAL_StatusTypeDef FlashDump_SendLive(UART_HandleTypeDef *huart,
+                                     const Flash_Payload *p1,
+                                     const Flash_Payload *p2,
+                                     uint32_t timestamp)
+{
+    static uint16_t live_seq = 0;
+    uint8_t frame[4 + 3 + 2 * DUMP_REC_SIZE + 2];
+    const uint8_t len = 3 + 2 * DUMP_REC_SIZE;
+
+    frame[0] = DUMP_SOF0;
+    frame[1] = DUMP_SOF1;
+    frame[2] = DUMP_PKT_LIVE;
+    frame[3] = len;
+    put_u16(&frame[4], live_seq++);
+    frame[6] = 2;
+    put_record(&frame[7],                 1, timestamp, p1);
+    put_record(&frame[7 + DUMP_REC_SIZE], 2, timestamp, p2);
+    put_u16(&frame[4 + len], FlashDump_CRC16(&frame[2], (uint16_t)(2 + len), 0xFFFF));
+
+    return HAL_UART_Transmit(huart, frame, sizeof(frame), 20);
+}
