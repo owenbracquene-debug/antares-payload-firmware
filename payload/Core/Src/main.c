@@ -49,22 +49,19 @@ typedef struct {
 #define FLASH_CS_LOW()   HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET)
 #define FLASH_CS_HIGH()  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET)
 #define RUN_FLASH_READBACK_TEST  1   // readout tester bij het opstarten (raakt de vluchtdata niet)
-#define ERASE_FLASH_ON_BOOT      0   // 1 = wist de VOLLEDIGE flash bij elke start (80-400 s). In TEST_MODE niet nodig, zie hieronder
+#define ERASE_FLASH_ON_BOOT      0   // 1 = wist de VOLLEDIGE flash bij elke start (80-400 s). Alleen eenmalig vóór de vlucht!
 
-// Landingsdetectie: |a| stabiel rond 1 g, pas na een minimale vluchtduur
-#define LANDED_MIN_FLIGHT_MS   300000UL  // min. 5 min na lancering (voorkomt trigger onder de parachute)
-#define LANDED_STILL_MS         10000UL  // zo lang moet |a| stilstaan
-#define LANDED_MAX_FLIGHT_MS  1800000UL  // vangnet: na 30 min altijd "geland"
-#define LANDED_G_LOW              785    // 0,8 g in 0,01 m/s²
-#define LANDED_G_HIGH            1177    // 1,2 g
-#define LANDED_SPREAD2         100000UL  // max. spreiding van |a|² in het venster (~0,05 g)
-#define DUMP_RETRY_MS           10000UL  // dump opnieuw proberen als de ESP32 niet antwoordt
+// WERKING: vanaf het inschakelen camera aan + elke 50 ms loggen naar de flash
+// (+ live naar de XIAO voor de SD-kaart). De lanceerdetectie zet ENKEL LED2 aan
+// en onthoudt launch_time; ze start of stopt niets.
+#define CAM_START_DELAY_MS       5000UL  // eerst de XIAO laten opstarten (camera + SD) voor START
+#define CAM_RETRY_MS            10000UL  // START opnieuw proberen zolang de camera niet bevestigde (vóór de lancering)
+#define LIVE_TO_XIAO                1    // 1 = elke meting ook live via UART naar de XIAO (CSV op de SD)
 
-// TESTMODUS: vervangt lancerings- en landingsdetectie.
-// Direct na het opstarten START naar de camera + loggen, na TEST_LOG_MS "geland" -> dump via UART.
-#define TEST_MODE                   0    // !! op 0 zetten voor de vlucht !!
-#define TEST_LOG_MS             20000UL  // zo lang loggen in testmodus
-#define TEST_START_DELAY_MS      5000UL  // eerst de XIAO laten opstarten (camera + SD) voor START
+// HERSTELMODUS na de vlucht: 1 = bij het opstarten de volledige flash naar de XIAO sturen
+// (zelfde dump als vroeger), daarna niets meer doen. Niet loggen, geen camera.
+// LED2 aan = dump gelukt, LED2 snel knipperend = dump mislukt.  !! op 0 voor de vlucht !!
+#define DUMP_ON_BOOT                0
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -106,11 +103,12 @@ volatile HAL_StatusTypeDef st_flash;
 const CS_Pin_t flash_cs = { GPIOA, GPIO_PIN_4 };   // W25Q256JV /CS op PA4
 volatile HAL_StatusTypeDef st_log_init, st_log;
 volatile uint8_t flash_test_ok = 0;
-volatile uint8_t landed = 0;
-volatile uint8_t dump_done = 0;
-volatile HAL_StatusTypeDef st_dump = HAL_BUSY;
+volatile HAL_StatusTypeDef st_dump = HAL_BUSY;   // alleen in herstelmodus (DUMP_ON_BOOT)
 volatile uint32_t dump_records = 0;
-uint32_t launch_time = 0, still_since = 0, still_min2 = 0, still_max2 = 0, t_dump = 0;
+volatile uint32_t launch_time = 0;                // ms sinds opstarten, 0 = geen lancering gezien
+volatile uint8_t  cam_attempts = 0;               // aantal START-pogingen
+uint32_t t_cam = 0;
+volatile HAL_StatusTypeDef st_live = HAL_OK;      // laatste live-zending naar de XIAO
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -310,10 +308,11 @@ static void leds_update(uint32_t now)
   sens_fault_seen |= f;
   led_set(GPIO_PIN_1, f == 0 ? 1 : (now / 100) % 2);
 
-  // LED2: lancering en camera
-  if (!launched)    led_set(GPIO_PIN_2, 0);
-  else if (ack_ok)  led_set(GPIO_PIN_2, 1);
-  else              led_set(GPIO_PIN_2, (now / 100) % 2);
+  // LED2: aan = lancering gedetecteerd.
+  //       Vóór de lancering snel knipperen = camera heeft START (nog) niet bevestigd.
+  if (launched)                         led_set(GPIO_PIN_2, 1);
+  else if (cam_attempts > 0 && !ack_ok) led_set(GPIO_PIN_2, (now / 100) % 2);
+  else                                  led_set(GPIO_PIN_2, 0);
 }
 // Wacht op een tekstregel van de XIAO die 'needle' bevat (bv. "OK START")
 static uint8_t uart_wait_line(const char *needle, uint32_t timeout_ms)
@@ -336,13 +335,11 @@ static uint8_t uart_wait_line(const char *needle, uint32_t timeout_ms)
   return 0;
 }
 
-// Lancering: camera starten (START, wachten op "OK START") en vanaf nu loggen
-static void start_flight(uint32_t now)
+// Camera starten: START sturen en wachten op "OK START" (max. tries x ~400 ms)
+static void camera_start(int tries)
 {
-  launched = 1;
-  launch_time = now;
   const char msg[] = "START\n";
-  for (int i = 0; i < 10 && !ack_ok; i++) {
+  for (int i = 0; i < tries && !ack_ok; i++) {
     __HAL_UART_CLEAR_FLAG(&huart1, UART_CLEAR_OREF | UART_CLEAR_NEF | UART_CLEAR_FEF);
     __HAL_UART_SEND_REQ(&huart1, UART_RXDATA_FLUSH_REQUEST);   // oude "READY" e.d. weggooien
     HAL_UART_Transmit(&huart1, (uint8_t *)msg, sizeof(msg) - 1, 100);
@@ -420,11 +417,21 @@ int main(void)
 #endif
   st_log_init = FlashLogger_Init(&flash_cs);   // gaat verder na de laatst beschreven pagina
 
-#if TEST_MODE
-  // Testmodus: alleen het gebruikte deel wissen (snel), zodat de dump enkel deze test bevat
-  for (uint32_t a = 0; a < flashLogger.write_addr; a += 4096UL)
-    W25Q_EraseSector(a, &flash_cs);
-  st_log_init = FlashLogger_Init(&flash_cs);   // nu vanaf adres 0
+#if DUMP_ON_BOOT
+  // Herstelmodus: volledige flash naar de XIAO (CSV op de SD), daarna stoppen.
+  HAL_Delay(CAM_START_DELAY_MS);               // XIAO laten opstarten
+  {
+    uint32_t n = 0;
+    for (int i = 0; i < 3 && st_dump != HAL_OK; i++)
+      st_dump = FlashDump_SendAll(&huart1, &flash_cs, &n);
+    dump_records = n;
+  }
+  while (1) {
+    uint32_t t = HAL_GetTick();
+    led_set(GPIO_PIN_0, (t / 500) % 2);
+    led_set(GPIO_PIN_1, 0);
+    led_set(GPIO_PIN_2, st_dump == HAL_OK ? 1 : (t / 100) % 2);
+  }
 #endif
   /* USER CODE END 2 */
 
@@ -453,85 +460,63 @@ int main(void)
 	                      + (uint32_t)((int32_t)acc_y * acc_y)
 	                      + (uint32_t)((int32_t)acc_z * acc_z);
 
-	        if (TEST_MODE) {
-	          // testmodus: detectoren uitgeschakeld (zie hieronder)
-	        } else if (!launched) {
+	        // Lanceerdetectie: |a| > 3 g gedurende 100 ms -> enkel LED2 + launch_time
+	        if (!launched) {
 	          uint32_t thr2 = (uint32_t)LAUNCH_THR * LAUNCH_THR;
 
 	          if (mag2 > thr2) {
 	            if (above_since == 0) above_since = now;
 	            if (now - above_since >= LAUNCH_MS) {
-	              start_flight(now);
+	              launched = 1;
+	              launch_time = now;
 	            }
 	          } else {
 	            above_since = 0;
 	          }
-	        } else if (!landed) {
-	          // 1b. Landingsdetectie: |a| binnen 0,8-1,2 g en nauwelijks variërend
-	          uint32_t lo2 = (uint32_t)LANDED_G_LOW * LANDED_G_LOW;
-	          uint32_t hi2 = (uint32_t)LANDED_G_HIGH * LANDED_G_HIGH;
-	          if (mag2 >= lo2 && mag2 <= hi2) {
-	            if (still_since == 0) {
-	              still_since = now; still_min2 = still_max2 = mag2;
-	            } else {
-	              if (mag2 < still_min2) still_min2 = mag2;
-	              if (mag2 > still_max2) still_max2 = mag2;
-	              if (still_max2 - still_min2 > LANDED_SPREAD2) {   // beweegt nog: venster opnieuw
-	                still_since = now; still_min2 = still_max2 = mag2;
-	              }
-	            }
-	            if (now - launch_time >= LANDED_MIN_FLIGHT_MS &&
-	                now - still_since >= LANDED_STILL_MS)
-	              landed = 1;
-	          } else {
-	            still_since = 0;
-	          }
-	          if (now - launch_time >= LANDED_MAX_FLIGHT_MS)
-	            landed = 1;
 	        }
 	      }
 	    }
 
-	    // 1a. Testmodus: meteen "lancering", na TEST_LOG_MS "geland"
-	    if (TEST_MODE) {
-	      if (!launched && now >= TEST_START_DELAY_MS) start_flight(now);
-	      if (launched && !landed && now - launch_time >= TEST_LOG_MS) landed = 1;
+	    // 1b. Camera starten vanaf het inschakelen (los van de lanceerdetectie).
+	    //     Eerste keer tot 10 pogingen (max. ~4 s, op het platform).
+	    //     Daarna 1 poging per CAM_RETRY_MS, maar niet meer na een lancering
+	    //     (blokkeert ~0,4 s en zou dan vluchtdata kosten).
+	    if (!ack_ok && now >= CAM_START_DELAY_MS) {
+	      if (cam_attempts == 0) {
+	        camera_start(10);
+	        cam_attempts = 1;
+	        t_cam = HAL_GetTick();
+	      } else if (!launched && now - t_cam >= CAM_RETRY_MS && cam_attempts < 255) {
+	        camera_start(1);
+	        cam_attempts++;
+	        t_cam = HAL_GetTick();
+	      }
 	    }
 
-	    // 1c. Na de landing: volledige flash naar de ESP32 sturen (blokkeert)
-	    if (landed && !dump_done && (t_dump == 0 || now - t_dump >= DUMP_RETRY_MS)) {
-	      led_set(GPIO_PIN_2, 1);
-	      uint32_t n = 0;
-	      st_dump = FlashDump_SendAll(&huart1, &flash_cs, &n);
-	      dump_records = n;
-	      if (st_dump == HAL_OK) dump_done = 1;
-	      t_dump = HAL_GetTick();
-	      if (t_dump == 0) t_dump = 1;
-	    }
-
-	    // 2. Druk, elke 50 ms
-	    if (!landed && now - t_pres >= 50) {   // na de landing niet meer loggen
+	    // 2. Druk, elke 50 ms. Vanaf het inschakelen naar de flash (+ live naar de XIAO)
+	    if (now - t_pres >= 50) {
 	      t_pres = now;
 	      ms5837_measure(&ps1);
 	      ms5837_measure(&ps2);
 	      if (ps2.st == HAL_OK) ps2_fail = 0;
 	      else if (ps2_fail < 255) ps2_fail++;
 
-	      // 2b. Naar flash, pas vanaf de lancering (= camerastart): één record per druksensor
-	      if (launched) {
-	        Flash_Payload rec = { .acc_x = acc_x, .acc_y = acc_y, .acc_z = acc_z };
-	        rec.temp = ps1.temp; rec.pres = ps1.pres;
-	        st_log = FlashLogger_LogPayload(&rec, 1, now);
-	        rec.temp = ps2.temp; rec.pres = ps2.pres;
-	        st_log = FlashLogger_LogPayload(&rec, 2, now);
-	      }
+	      // 2b. Eén record per druksensor
+	      Flash_Payload rec1 = { .acc_x = acc_x, .acc_y = acc_y, .acc_z = acc_z };
+	      Flash_Payload rec2 = rec1;
+	      rec1.temp = ps1.temp; rec1.pres = ps1.pres;
+	      rec2.temp = ps2.temp; rec2.pres = ps2.pres;
+	      st_log = FlashLogger_LogPayload(&rec1, 1, now);
+	      st_log = FlashLogger_LogPayload(&rec2, 2, now);
+	      if (LIVE_TO_XIAO)
+	        st_live = FlashDump_SendLive(&huart1, &rec1, &rec2, now);
 	    }
 
-	    // 2c. Herstel, max. 1x per seconde (ook tijdens de vlucht, tot de landing):
+	    // 2c. Herstel, max. 1x per seconde:
 	    //     - bus vastgelopen (5x na elkaar BNO055 niet gelezen = 50 ms, of 3x MS5837 bus 2)
 	    //       -> bus vrijmaken + sensoren op die bus opnieuw initialiseren
 	    //     - losse sensor die niet antwoordt -> alleen die sensor opnieuw initialiseren
-	    if (!landed && now - t_retry >= 1000) {
+	    if (now - t_retry >= 1000) {
 	      t_retry = now;
 	      if (i2c1_fail >= 5) {
 	        i2c_bus_recover(&hi2c1, GPIOB, GPIO_PIN_7, GPIOB, GPIO_PIN_8);    // SDA PB7, SCL PB8

@@ -20,10 +20,9 @@ The payload studies the in-flight behaviour of a liquid in a partially filled ta
 ### Operating sequence
 
 1. **Power-up:** LED start-up animation, sensor initialisation and self-check.
-2. **On the pad:** continuous acquisition and logging, which provides a reference baseline for the pressure sensors.
-3. **Launch detection:** when the total acceleration $|a| = \sqrt{a_x^2 + a_y^2 + a_z^2}$ stays above **3 g for 100 ms**, launch is confirmed. The sustained-threshold requirement rejects short shocks from handling.
-4. **Camera start:** a `START` command is sent to the camera module over UART and retried until it is acknowledged.
-5. **Flight and recovery:** acquisition and logging continue; the camera keeps recording.
+2. **From power-up on:** every 50 ms one record per pressure sensor is written to the SPI flash and streamed live to the camera module, which appends it to CSV files on its SD card. About 5 s after power-up a `START` command starts the video recording.
+3. **Launch detection (indication only):** when the total acceleration $|a| = \sqrt{a_x^2 + a_y^2 + a_z^2}$ stays above **3 g for 100 ms**, LED2 turns on and the launch time is stored. Logging and recording do not depend on it.
+4. **Recovery:** the flash keeps the complete log. If the SD copy is incomplete, set `DUMP_ON_BOOT` to 1 to send the whole flash log to the SD card again.
 
 ---
 
@@ -59,8 +58,9 @@ The MS5837 has a fixed I2C address, so the two pressure sensors are placed on se
 
 | Direction | Message | Meaning |
 |---|---|---|
-| STM32 → camera | `START\n` | Launch detected, start recording |
-| Camera → STM32 | `ACK\n` | Command received, recording started |
+| STM32 → camera | `START\n` | Start recording (sent ~5 s after power-up) |
+| Camera → STM32 | `OK START\n` | Command received, recording started |
+| STM32 → camera | LIVE frame (binary, every 50 ms) | Sensor records for the CSV on the SD card, see `flash_dump.h` and `esp_cam_arduino_code/live_receiver.h` |
 
 ### Status LEDs
 
@@ -69,9 +69,9 @@ The MS5837 has a fixed I2C address, so the two pressure sensors are placed on se
 | LED0 | Blinking (1 Hz) | Controller running |
 | LED1 | On | All sensors responding correctly |
 | LED1 | Fast blinking | Sensor fault |
-| LED2 | Off | Waiting for launch |
-| LED2 | On | Launch detected, camera acknowledged |
-| LED2 | Fast blinking | Launch detected, but no acknowledgement from the camera |
+| LED2 | Off | No launch detected yet, camera running |
+| LED2 | Fast blinking | Before launch: camera did not acknowledge `START` |
+| LED2 | On | Launch detected |
 
 ---
 
