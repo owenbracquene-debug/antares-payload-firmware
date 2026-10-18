@@ -98,6 +98,9 @@ uint32_t t_acc = 0, t_pres = 0, above_since = 0;
 // Diagnose LED1: welke sensorcontrole faalt (bitmasker, zie leds_update)
 volatile uint8_t sens_fault = 0, sens_fault_seen = 0;
 uint32_t t_retry = 0;
+// Busherstel: aantal mislukte transfers na elkaar (zie 2c in de hoofdlus)
+uint8_t i2c1_fail = 0, ps2_fail = 0;
+volatile uint16_t i2c1_recoveries = 0, i2c2_recoveries = 0;
 uint8_t flash_id[3];
 volatile HAL_StatusTypeDef st_flash;
 const CS_Pin_t flash_cs = { GPIOA, GPIO_PIN_4 };   // W25Q256JV /CS op PA4
@@ -223,6 +226,42 @@ static void ms5837_measure(MS5837_t *s)
 }
 // BNO055: chip-ID controleren en instellen op 16 g, ACCONLY-modus.
 // Wordt bij het opstarten aangeroepen en opnieuw (vóór de lancering) als het mislukte.
+// Vastgelopen I2C-bus vrijmaken: I2C uit, 9 klokpulsen op SCL (een slave die SDA vasthoudt
+// laat dan los), een STOP-conditie, en daarna de I2C-module opnieuw initialiseren.
+static void i2c_delay(void)
+{
+  for (volatile int d = 0; d < 20; d++) { }
+}
+
+static void i2c_bus_recover(I2C_HandleTypeDef *hi2c,
+                            GPIO_TypeDef *sda_port, uint16_t sda_pin,
+                            GPIO_TypeDef *scl_port, uint16_t scl_pin)
+{
+  HAL_I2C_DeInit(hi2c);                          // pinnen terug naar GPIO
+
+  GPIO_InitTypeDef g = {0};
+  g.Mode  = GPIO_MODE_OUTPUT_OD;
+  g.Pull  = GPIO_NOPULL;
+  g.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_WritePin(sda_port, sda_pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(scl_port, scl_pin, GPIO_PIN_SET);
+  g.Pin = sda_pin; HAL_GPIO_Init(sda_port, &g);
+  g.Pin = scl_pin; HAL_GPIO_Init(scl_port, &g);
+  i2c_delay();
+
+  for (int i = 0; i < 9; i++) {
+    HAL_GPIO_WritePin(scl_port, scl_pin, GPIO_PIN_RESET); i2c_delay();
+    HAL_GPIO_WritePin(scl_port, scl_pin, GPIO_PIN_SET);   i2c_delay();
+  }
+  // STOP: SDA laag -> hoog terwijl SCL hoog is
+  HAL_GPIO_WritePin(sda_port, sda_pin, GPIO_PIN_RESET); i2c_delay();
+  HAL_GPIO_WritePin(scl_port, scl_pin, GPIO_PIN_SET);   i2c_delay();
+  HAL_GPIO_WritePin(sda_port, sda_pin, GPIO_PIN_SET);   i2c_delay();
+
+  if (hi2c->Instance == I2C1) MX_I2C1_Init();    // zet de pinnen terug als I2C
+  else                        MX_I2C2_Init();
+}
+
 static void bno055_init(void)
 {
   // Chip-ID controleren (moet 0xA0 zijn)
@@ -403,6 +442,8 @@ int main(void)
 	      t_acc = now;
 	      uint8_t a[6];
 	      st_acc = HAL_I2C_Mem_Read(&hi2c1, 0x28 << 1, 0x08, I2C_MEMADD_SIZE_8BIT, a, 6, 100);
+	      if (st_acc == HAL_OK) i2c1_fail = 0;
+	      else if (i2c1_fail < 255) i2c1_fail++;
 	      if (st_acc == HAL_OK) {
 	        acc_x = (int16_t)((a[1] << 8) | a[0]);
 	        acc_y = (int16_t)((a[3] << 8) | a[2]);
@@ -473,6 +514,8 @@ int main(void)
 	      t_pres = now;
 	      ms5837_measure(&ps1);
 	      ms5837_measure(&ps2);
+	      if (ps2.st == HAL_OK) ps2_fail = 0;
+	      else if (ps2_fail < 255) ps2_fail++;
 
 	      // 2b. Naar flash, pas vanaf de lancering (= camerastart): één record per druksensor
 	      if (launched) {
@@ -484,13 +527,30 @@ int main(void)
 	      }
 	    }
 
-	    // 2c. Vóór de lancering: sensoren die bij het opstarten niet antwoordden elke seconde
-	    //     opnieuw initialiseren (blokkeert kort, daarom niet meer tijdens de vlucht)
-	    if (!launched && now - t_retry >= 1000) {
+	    // 2c. Herstel, max. 1x per seconde (ook tijdens de vlucht, tot de landing):
+	    //     - bus vastgelopen (5x na elkaar BNO055 niet gelezen = 50 ms, of 3x MS5837 bus 2)
+	    //       -> bus vrijmaken + sensoren op die bus opnieuw initialiseren
+	    //     - losse sensor die niet antwoordt -> alleen die sensor opnieuw initialiseren
+	    if (!landed && now - t_retry >= 1000) {
 	      t_retry = now;
-	      if (bno_id != 0xA0) bno055_init();
-	      if (!ps1.crc_ok)    ms5837_init(&ps1);
-	      if (!ps2.crc_ok)    ms5837_init(&ps2);
+	      if (i2c1_fail >= 5) {
+	        i2c_bus_recover(&hi2c1, GPIOB, GPIO_PIN_7, GPIOB, GPIO_PIN_8);    // SDA PB7, SCL PB8
+	        i2c1_recoveries++;
+	        bno055_init();
+	        ms5837_init(&ps1);
+	        i2c1_fail = 0;
+	      } else {
+	        if (bno_id != 0xA0)                   bno055_init();
+	        if (!ps1.crc_ok || ps1.st != HAL_OK)  ms5837_init(&ps1);
+	      }
+	      if (ps2_fail >= 3) {
+	        i2c_bus_recover(&hi2c2, GPIOA, GPIO_PIN_10, GPIOA, GPIO_PIN_11);  // SDA PA10, SCL PA11
+	        i2c2_recoveries++;
+	        ms5837_init(&ps2);
+	        ps2_fail = 0;
+	      } else if (!ps2.crc_ok) {
+	        ms5837_init(&ps2);
+	      }
 	    }
 
 	    // 3. LED's bijwerken
